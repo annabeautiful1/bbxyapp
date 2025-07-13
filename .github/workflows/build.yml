@@ -3,13 +3,13 @@ name: Build BBXYApp
 on:
   push:
     branches: [ main, develop ]
+    tags:
+      - 'v*'
   pull_request:
     branches: [ main ]
-  release:
-    types: [ published ]
 
 env:
-  FLUTTER_VERSION: '3.19.0'
+  IS_STABLE: ${{ !contains(github.ref, '-') }}
 
 jobs:
   build:
@@ -31,135 +31,159 @@ jobs:
           - platform: macos
             os: macos-latest
             arch: arm64
+          - platform: windows
+            os: windows-11-arm
+            arch: arm64
+          - platform: linux
+            os: ubuntu-24.04-arm
+            arch: arm64
 
     steps:
+      - name: Setup rust for ARM Windows
+        if: startsWith(matrix.os, 'windows-11-arm')
+        run: |
+          Invoke-WebRequest -Uri "https://win.rustup.rs/aarch64" -OutFile rustup-init.exe
+          .\rustup-init.exe -y --default-toolchain stable
+          $cargoPath = "$env:USERPROFILE\.cargo\bin"
+          Add-Content $env:GITHUB_PATH $cargoPath
+
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Java (Android)
-        if: matrix.platform == 'android'
-        uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          fetch-depth: 0
 
-      - name: Setup Android SDK
-        if: matrix.platform == 'android'
-        uses: android-actions/setup-android@v3
-        with:
-          api-level: 33
-          build-tools: 33.0.0
+      - name: Setup Android Signing
+        if: startsWith(matrix.platform,'android')
+        run: |
+          echo "${{ secrets.KEYSTORE }}" | base64 --decode > android/app/keystore.jks
+          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> android/local.properties
+          echo "storePassword=${{ secrets.STORE_PASSWORD }}" >> android/local.properties
+          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> android/local.properties
 
-      - name: Setup Flutter
+      - name: Setup Flutter Master
+        if: startsWith(matrix.os, 'windows-11-arm') || startsWith(matrix.os, 'ubuntu-24.04-arm')
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'master'
+          cache: true
+
+      - name: Setup Flutter
+        if: ${{ !(startsWith(matrix.os, 'windows-11-arm') || startsWith(matrix.os, 'ubuntu-24.04-arm')) }}
+        uses: subosito/flutter-action@v2
+        with:
           channel: 'stable'
           cache: true
 
-      - name: Get Flutter Dependencies
+      - name: Install Linux dependencies
+        if: startsWith(matrix.platform, 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libblkid-dev liblzma-dev ninja-build
+
+      - name: Get Flutter dependencies
         run: flutter pub get
+
+      - name: Generate code
+        run: flutter packages pub run build_runner build --delete-conflicting-outputs
 
       - name: Build Android APK
         if: matrix.platform == 'android'
         run: |
           flutter build apk --release --split-per-abi
-          flutter build appbundle --release
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk dist/BBXYApp-${{ github.ref_name }}-android-arm64-v8a.apk || true
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk dist/BBXYApp-${{ github.ref_name }}-android-armeabi-v7a.apk || true
+          cp build/app/outputs/flutter-apk/app-x86_64-release.apk dist/BBXYApp-${{ github.ref_name }}-android-x86_64.apk || true
 
       - name: Build Windows
         if: matrix.platform == 'windows'
-        run: flutter build windows --release
+        run: |
+          flutter config --enable-windows-desktop
+          flutter build windows --release
+          mkdir -p dist
+          Compress-Archive -Path "build/windows/x64/runner/Release/*" -DestinationPath "dist/BBXYApp-${{ github.ref_name }}-windows-${{ matrix.arch }}.zip"
+
+      - name: Build macOS
+        if: matrix.platform == 'macos'
+        run: |
+          flutter config --enable-macos-desktop
+          flutter build macos --release
+          mkdir -p dist
+          cd build/macos/Build/Products/Release
+          hdiutil create -volname "BBXYApp" -srcfolder BBXYApp.app -ov -format UDZO ../../../../../dist/BBXYApp-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg
 
       - name: Build Linux
         if: matrix.platform == 'linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libgtk-3-dev
+          flutter config --enable-linux-desktop
           flutter build linux --release
+          mkdir -p dist
+          cd build/linux/x64/release/bundle
+          tar -czf ../../../../../dist/BBXYApp-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz *
 
-      - name: Build macOS
-        if: matrix.platform == 'macos'
-        run: flutter build macos --release
-
-      - name: Upload Android Artifacts
-        if: matrix.platform == 'android'
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: android-artifacts
-          path: |
-            build/app/outputs/flutter-apk/*.apk
-            build/app/outputs/bundle/release/*.aab
+          name: artifact-${{ matrix.platform }}${{ matrix.arch && format('-{0}', matrix.arch) }}
+          path: ./dist
+          overwrite: true
 
-      - name: Upload Windows Artifacts
-        if: matrix.platform == 'windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-artifacts-${{ matrix.arch }}
-          path: build/windows/x64/runner/Release/
-
-      - name: Upload Linux Artifacts
-        if: matrix.platform == 'linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-artifacts-${{ matrix.arch }}
-          path: build/linux/x64/release/bundle/
-
-      - name: Upload macOS Artifacts
-        if: matrix.platform == 'macos'
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-artifacts-${{ matrix.arch }}
-          path: build/macos/Build/Products/Release/
-
-  release:
-    needs: build
+  upload:
+    permissions: write-all
+    needs: [ build ]
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
-    permissions:
-      contents: write
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - name: Download All Artifacts
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: ./artifacts
+          path: ./dist/
+          pattern: artifact-*
+          merge-multiple: true
 
-      - name: Create Release Assets
+      - name: Generate release notes
         run: |
-          cd artifacts
-          # 创建Android发布包
-          mkdir -p ../release
-          cp android-artifacts/*.apk ../release/
-          cp android-artifacts/*.aab ../release/
+          echo "## 🚀 新版本发布" > release.md
+          echo "" >> release.md
+          echo "### 📱 下载链接" >> release.md
+          echo "" >> release.md
+          echo "| 平台 | 架构 | 下载链接 |" >> release.md
+          echo "|------|------|----------|" >> release.md
           
-          # 创建Windows发布包
-          cd windows-artifacts-amd64
-          zip -r ../../release/bbxyapp-windows-amd64.zip .
-          cd ..
+          for file in dist/*; do
+            if [[ -f "$file" ]]; then
+              filename=$(basename "$file")
+              echo "| $(echo $filename | cut -d'-' -f2) | $(echo $filename | cut -d'-' -f3 | cut -d'.' -f1) | [$filename](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$filename) |" >> release.md
+            fi
+          done
           
-          # 创建Linux发布包
-          cd linux-artifacts-amd64
-          tar -czf ../../release/bbxyapp-linux-amd64.tar.gz .
-          cd ..
+          echo "" >> release.md
+          echo "### 📋 更新日志" >> release.md
+          echo "" >> release.md
           
-          # 创建macOS发布包
-          if [ -d "macos-artifacts-amd64" ]; then
-            cd macos-artifacts-amd64
-            zip -r ../../release/bbxyapp-macos-amd64.zip .
-            cd ..
-          fi
-          
-          if [ -d "macos-artifacts-arm64" ]; then
-            cd macos-artifacts-arm64
-            zip -r ../../release/bbxyapp-macos-arm64.zip .
-            cd ..
-          fi
+          # 获取最新的提交日志
+          git log --pretty=format:"- %s" $(git describe --tags --abbrev=0 HEAD~1)..HEAD >> release.md
 
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v1
+      - name: Generate checksums
+        if: env.IS_STABLE == 'true'
+        run: |
+          cd ./dist
+          for file in $(find . -type f -not -name "*.sha256"); do
+            sha256sum "$file" > "${file}.sha256"
+          done
+
+      - name: Release
+        if: env.IS_STABLE == 'true'
+        uses: softprops/action-gh-release@v2
         with:
-          files: release/*
-          tag_name: ${{ github.event.release.tag_name }}
-          name: ${{ github.event.release.name }}
-          body: ${{ github.event.release.body }}
+          files: ./dist/*
+          body_path: './release.md'
+          draft: false
+          prerelease: ${{ contains(github.ref, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
