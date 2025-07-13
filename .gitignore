@@ -1,0 +1,33 @@
+# Flutter相关
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+/build/
+
+# IDE相关
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS相关
+.DS_Store
+Thumbs.db
+
+# 不相关的文件夹
+FlClash/
+baibianxiaoying.top/
+
+# 临时文件
+*.tmp
+*.temp
+*.log
+
+# 生成的文件
+*.g.dart
+*.freezed.dart
+*.mocks.dart 
